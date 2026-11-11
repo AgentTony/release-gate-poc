@@ -8,6 +8,15 @@ on:
         required: true
         type: string
 
+      source_branch:
+        description: "Create the release branch from"
+        required: true
+        type: choice
+        options:
+          - develop
+          - main
+        default: develop
+
 permissions:
   contents: read
 
@@ -34,15 +43,21 @@ jobs:
         uses: actions/github-script@v7
         env:
           RELEASE_NAME: ${{ inputs.release_name }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
         with:
           github-token: ${{ steps.app.outputs.token }}
           script: |
             const { owner, repo } = context.repo;
             const name = process.env.RELEASE_NAME;
+            const sourceName = process.env.SOURCE_BRANCH;
 
-            // Keep release names within the ruleset's naming pattern.
             if (!/^release\/[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)*$/.test(name)) {
               throw new Error("Use a name such as release/2.0.");
+            }
+
+            // Validate API requests as well as selections made in the UI.
+            if (!["develop", "main"].includes(sourceName)) {
+              throw new Error("Source branch must be develop or main.");
             }
 
             const branches = await github.paginate(
@@ -61,28 +76,36 @@ jobs:
               throw new Error("Both main and develop must exist.");
             }
 
+            const source = branches.find(
+              branch => branch.name === sourceName
+            );
+
             const releases = branches.filter(
               branch => branch.name.startsWith("release/")
             );
 
-            // Fail closed if the expected release history is missing.
             if (releases.length === 0) {
-              throw new Error("No existing release branch found. Check the release history.");
+              throw new Error(
+                "No existing release branch found. Check the release history."
+              );
             }
 
             const pending = [];
 
             for (const release of releases) {
               for (const target of [main, develop]) {
-                const { data } = await github.rest.repos.compareCommitsWithBasehead({
-                  owner,
-                  repo,
-                  basehead: `${release.commit.sha}...${target.commit.sha}`,
-                  per_page: 1
-                });
+                const { data } =
+                  await github.rest.repos.compareCommitsWithBasehead({
+                    owner,
+                    repo,
+                    basehead: `${release.commit.sha}...${target.commit.sha}`,
+                    per_page: 1
+                  });
 
                 if (data.merge_base_commit.sha !== release.commit.sha) {
-                  pending.push(`${release.name} is not fully included in ${target.name}`);
+                  pending.push(
+                    `${release.name} is not fully included in ${target.name}`
+                  );
                 }
               }
             }
@@ -91,17 +114,24 @@ jobs:
               for (const message of pending) {
                 core.error(message);
               }
-              throw new Error("Release creation blocked: merge the pending release changes first.");
+
+              throw new Error(
+                "Release creation blocked: merge the pending release changes first."
+              );
             }
 
-            // Detect branch changes made while the checks were running.
+            // Stop if a checked branch changed during verification.
             for (const branch of [main, develop, ...releases]) {
               const { data } = await github.rest.repos.getBranch({
-                owner, repo, branch: branch.name
+                owner,
+                repo,
+                branch: branch.name
               });
 
               if (data.commit.sha !== branch.commit.sha) {
-                throw new Error(`${branch.name} changed during checks. Run the workflow again.`);
+                throw new Error(
+                  `${branch.name} changed during checks. Run the workflow again.`
+                );
               }
             }
 
@@ -109,10 +139,15 @@ jobs:
               owner,
               repo,
               ref: `refs/heads/${name}`,
-              sha: develop.commit.sha
+              sha: source.commit.sha
             });
 
             await core.summary
               .addHeading("Release branch created")
-              .addRaw(`${name} created from develop at ${develop.commit.sha}`)
+              .addTable([
+                ["Setting", "Value"],
+                ["New branch", name],
+                ["Source branch", sourceName],
+                ["Source commit", source.commit.sha]
+              ])
               .write();
